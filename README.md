@@ -13,15 +13,22 @@
 
 ## 本 Fork 的增强
 
+- **免维护登录**：账号密码登录为主路线（Secrets 永不过期），在浏览器内填表提交，
+  可承载 Cloudflare 挑战；**不再需要每次运行前重新抓 Cookie 填变量**。
+- **Turnstile 自动尝试**：遇到 Cloudflare 人机验证时，自动定位验证框并模拟点击复选框（尽力而为）。
+- **失败现场留证**：登录失败时自动保存截图 + HTML 到 `debug/`，Actions 运行结束后作为
+  artifact 上传（`debug-screenshots`），不用再猜"到底卡在哪一步"。
 - **LDC 积分站查询**：签到后自动调用 `credit.linux.do` 的 `/api/v1/oauth/user-info` 接口，
   上报「可用余额 / 社区余额 / 待结算余额 / 信任等级」。该接口已对照
   [linux-do/credit](https://github.com/linux-do/credit) 源码核实（GET 请求无需 CSRF 头）。
   会话获取优先走浏览器自动 OAuth（linux.do 已登录时通常自动完成），也可用
   `LINUXDO_CREDIT_COOKIES` 手动提供 Cookie 兜底。
-- **浏览器内账号密码登录**：登录改为在 Chromium 内填表提交，可承载 Cloudflare 挑战，
-  比纯 HTTP POST 更稳；Cookie 登录失败时自动回退。
-- **登录判定修复**：原版在验证元素异常时会误报登录成功，现改为严格判定。
+- **登录判定修复**：原版 `"avatar" in html` 的宽松判定在未登录时也会命中（Discourse 页面
+  JS/CSS 里含大量 avatar 字符串），导致误报登录成功；现改为 `/session/current.json` 同步
+  XHR + 头部用户元素双重判定。
 - **修复主题数不足崩溃**：`random.sample` 在主题少于 10 篇时会抛异常，已改为按实际数量抽样。
+- **CF 挑战识别修复**：linux.do 正常页面（约 800KB HTML）内嵌了 challenge-platform 脚本
+  引用，按 HTML 关键字全文匹配会把正常页误判为挑战页；已改为仅对小页面（< 50KB）生效。
 - **点赞默认关闭**：社区已取消点赞积分奖励，脚本点赞存在被判定异常行为的风险，
   新增 `LIKE_ENABLED` 开关，默认 `false`。如需开启请自行承担风险。
 - **关闭上游自动同步**：因已深度定制，`sync.yml` 的定时同步已关闭（保留手动触发），
@@ -40,26 +47,29 @@
 - (可选)`wxpush`通知功能，推送获取签到结果。
 ## 环境变量配置
 
-### 登录方式（二选一）
+### 登录方式
 
-**方式一：Cookie 登录（优先）**
-
-| 环境变量名称             | 描述                                         | 示例值                          |
-|--------------------|--------------------------------------------|------------------------------|
-| `LINUXDO_COOKIES`  | 从浏览器 DevTools 复制的 Cookie 字符串，设置后优先使用，无需账号密码 | `_t=xxx; _forum_session=yyy` |
-
-> 获取方式：打开 [linux.do](https://linux.do/) 并登录 → 按 F12 → Application → Cookies → `https://linux.do` → 全选所有 Cookie 复制为字符串粘贴即可。
-
-**方式二：账号密码登录**
+**推荐：账号密码登录（免维护，不再需要反复抓 Cookie）**
 
 | 环境变量名称             | 描述                | 示例值                                |
 |--------------------|-------------------|------------------------------------|
 | `LINUXDO_USERNAME` | 你的 LinuxDo 用户名或邮箱 | `your_username` 或 `your@email.com` |
 | `LINUXDO_PASSWORD` | 你的 LinuxDo 密码     | `your_password`                    |
 
-> 若同时设置了 `LINUXDO_COOKIES` 和账号密码，**Cookie 登录优先**；Cookie 失效时自动回退到账号密码登录。
+> 为什么不再推荐 Cookie：`cf_clearance` 绑定 IP（你本地抓的 Cookie 到 GitHub Actions 换了个 IP 就失效），且寿命只有几十分钟；
+> 真正长效的只有 `_t`，但极易漏复制或被登出。账号密码放在 GitHub Secrets 里永不过期（除非你自己改密码），登录在浏览器内完成，可承载 Cloudflare 挑战。
+> **配置一次账号密码即可，之后无需任何维护。**
 
-~~之前的USERNAME和PASSWORD环境变量仍然可用，但建议使用新的环境变量~~
+**可选：Cookie 登录（仅在不想提供密码时使用）**
+
+| 环境变量名称             | 描述                                         | 示例值                          |
+|--------------------|--------------------------------------------|------------------------------|
+| `LINUXDO_COOKIES`  | 从浏览器 DevTools 复制的 Cookie 字符串        | `_t=xxx; _forum_session=yyy` |
+
+> 获取方式：打开 [linux.do](https://linux.do/) 并登录 → 按 F12 → Application → Cookies → `https://linux.do` → **务必包含 `_t`**（长效登录凭证），复制为字符串粘贴。
+> 只有 `_forum_session` 等临时 Cookie 是登不上的。
+
+> 若同时设置了账号密码和 Cookie，**账号密码优先**；密码登录失败时自动回退尝试 Cookie。
 
 **LDC 积分站（可选）**
 

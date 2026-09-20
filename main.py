@@ -9,6 +9,7 @@ LinuxDo 每日签到 + LDC 积分站余额查询
 """
 
 import os
+import json
 import random
 import time
 import functools
@@ -87,7 +88,11 @@ CREDIT_USER_INFO_URL = "https://credit.linux.do/api/v1/oauth/user-info"
 CONNECT_URL = "https://connect.linux.do/"
 
 # Cloudflare 挑战页特征标题
-CF_TITLE_KEYWORDS = ("请稍候", "just a moment", "attention required")
+CF_TITLE_KEYWORDS = ("请稍候", "just a moment", "attention required", "checking your browser",
+                     "verify you are human", "请完成验证")
+# Cloudflare 挑战页 HTML 特征（在完整 HTML 里找，不限头部）
+CF_HTML_KEYWORDS = ("challenge-platform", "challenges.cloudflare.com", "cf-challenge",
+                    "cf-turnstile", "cdn-cgi/challenge", "cf-error-details")
 
 TRUST_LEVEL_NAMES = {
     0: "新用户",
@@ -173,7 +178,12 @@ class LinuxDoBrowser:
 
     @staticmethod
     def _is_cf_challenge(page) -> bool:
-        """判断当前页面是否处于 Cloudflare 挑战页"""
+        """
+        判断当前页面是否处于 Cloudflare 挑战页。
+        注意：linux.do 正常页面（约 800KB HTML）里也内嵌了 challenge-platform
+        等脚本引用，因此 HTML 关键字只对"小页面"生效（挑战页只有几 KB），
+        否则正常论坛页会被永久误判为挑战页。
+        """
         try:
             title = (page.title or "").strip().lower()
         except Exception:
@@ -181,18 +191,97 @@ class LinuxDoBrowser:
         if any(k in title for k in CF_TITLE_KEYWORDS):
             return True
         try:
-            html_head = (page.html or "")[:2000].lower()
+            html = page.html or ""
         except Exception:
-            html_head = ""
-        return ("cf-challenge" in html_head) or ("cdn-cgi/challenge-platform" in html_head)
+            return False
+        if len(html) > 50_000:
+            # 论坛正常页远大于此，不可能是挑战页
+            return False
+        low = html.lower()
+        return any(k in low for k in CF_HTML_KEYWORDS)
+
+    @classmethod
+    def _page_diag(cls, page, tag: str) -> None:
+        """输出页面诊断信息（只读，任何异常仅降级为跳过）"""
+        try:
+            title = page.title or ""
+        except Exception:
+            title = "<err>"
+        try:
+            url = page.url
+        except Exception:
+            url = "<err>"
+        try:
+            html_len = len(page.html or "")
+        except Exception:
+            html_len = -1
+        cf = "yes" if cls._is_cf_challenge(page) else "no"
+        logger.info(f"[诊断:{tag}] title={title!r} url={url} html_len={html_len} cf_challenge={cf}")
+
+    def _dump_debug(self, page, tag: str) -> None:
+        """失败现场留证：截图 + HTML，供 GitHub Actions artifact 下载排查"""
+        try:
+            import os
+
+            os.makedirs("debug", exist_ok=True)
+            ts = time.strftime("%H%M%S")
+            shot = f"debug/{tag}_{ts}.png"
+            htmlf = f"debug/{tag}_{ts}.html"
+            try:
+                page.get_screenshot(shot)
+            except Exception as e:
+                logger.warning(f"截图失败: {e}")
+                shot = ""
+            try:
+                with open(htmlf, "w", encoding="utf-8") as f:
+                    f.write(page.html or "")
+            except Exception as e:
+                logger.warning(f"HTML 落盘失败: {e}")
+                htmlf = ""
+            saved = [p for p in (shot, htmlf) if p]
+            logger.info(f"已保存失败现场: {saved if saved else '(无)'}")
+        except Exception as e:
+            logger.warning(f"保存调试信息异常: {e}")
+
+    def _try_solve_turnstile(self, page) -> bool:
+        """
+        尝试点击 Cloudflare Turnstile 人机验证复选框。
+        Turnstile 位于跨域 iframe 内无法直接操作 DOM，但可以先定位 iframe
+        在页面中的坐标，再用鼠标事件点击复选框区域（约左侧 30px 处）。
+        属于尽力而为：点击失败不影响原有等待逻辑。
+        """
+        try:
+            rect_js = """
+var f = document.querySelector('iframe[src*="challenges.cloudflare.com"]')
+      || document.querySelector('iframe[title*=" Widget"]')
+      || document.querySelector('.cf-turnstile iframe');
+if (!f) return null;
+var r = f.getBoundingClientRect();
+return [r.x, r.y, r.width, r.height];
+"""
+            rect = page.run_js(rect_js)
+            if not rect or len(rect) != 4 or rect[2] <= 0:
+                return False
+            x, y, w, h = rect
+            # 复选框在 iframe 左侧偏中位置，加一点随机量模拟真人
+            cx = x + min(30, w / 3) + random.uniform(-3, 3)
+            cy = y + h / 2 + random.uniform(-3, 3)
+            page.actions.move_to((cx, cy)).click()
+            logger.info(f"已尝试点击 Turnstile 复选框 ({cx:.0f},{cy:.0f})")
+            return True
+        except Exception:
+            return False
 
     def _wait_cf_clear(self, page, timeout: int = 45) -> bool:
-        """等待 Cloudflare 挑战结束"""
+        """等待 Cloudflare 挑战结束；期间尝试自动点击人机验证复选框"""
         deadline = time.time() + timeout
+        clicked = False
         while time.time() < deadline:
             if not self._is_cf_challenge(page):
                 return True
-            time.sleep(2)
+            if not clicked:
+                clicked = self._try_solve_turnstile(page)
+            time.sleep(3)
         return not self._is_cf_challenge(page)
 
     def _goto_with_cf_retry(self, page, url: str, attempts: int = 3, wait_cf: int = 45) -> bool:
@@ -212,18 +301,36 @@ class LinuxDoBrowser:
 
     def _wait_login(self, timeout: int = 30) -> bool:
         """
-        等待论坛登录态出现（严格判定）。
+        等待论坛登录态出现（严格判定，多信号融合）。
         注意：不能用 "avatar" in html 这类宽松判断 —— Discourse 未登录页面的
         HTML/JS 里也大量含 avatar 字符串，会误报登录成功。
-        #current-user 头像按钮仅在已登录时渲染。
+        判定优先级:
+        1. 同步 XHR 请求 /session/current.json 返回 current_user（最权威）
+        2. 头部用户元素出现（多套选择器兜底，Discourse 版本间 id 可能变化）
         """
+        selectors = ("@id=current-user", ".header-dropdown-toggle.current-user",
+                     "#toggle-current-user", "li.current-user button")
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # 信号 1: 同步 XHR（页面同源，能直接读到登录态）
             try:
-                if self.page.ele("@id=current-user", timeout=2):
-                    return True
+                res = self.page.run_js(
+                    "var x=new XMLHttpRequest();"
+                    "x.open('GET','/session/current.json',false);"
+                    "try{x.send()}catch(e){return 'XHR_ERR'}"
+                    "return (x.status===200 && x.responseText.indexOf('current_user')>-1) ? 'LOGGED_IN' : ('HTTP'+x.status);"
+                )
             except Exception:
-                pass
+                res = None
+            if res == "LOGGED_IN":
+                return True
+            # 信号 2: DOM 元素（XHR 被拦截或页面结构变化时兜底）
+            for sel in selectors:
+                try:
+                    if self.page.ele(sel, timeout=1):
+                        return True
+                except Exception:
+                    continue
             time.sleep(2)
         return False
 
@@ -288,17 +395,24 @@ class LinuxDoBrowser:
 
         # 同步到 DrissionPage
         self.page.set.cookies(dp_cookies)
+        # 提示：Cookie 登录必须包含 _t（长期记忆 Cookie）。只复制 _forum_session
+        # 等临时 Cookie 是登不上的。names 不打印 value，只打印键名辅助排查。
+        logger.info(f"Cookie 键名: {[c['name'] for c in dp_cookies]}")
         logger.info("Cookie 设置完成，导航至 linux.do...")
         if not self._goto_with_cf_retry(self.page, HOME_URL):
             logger.error("Cloudflare 挑战持续未通过，Cookie 登录终止")
+            self._page_diag(self.page, "cookie_cf_fail")
+            self._dump_debug(self.page, "cookie_cf_fail")
             return False
-        time.sleep(3)
+        time.sleep(5)
 
-        ok = self._wait_login(20)
+        ok = self._wait_login(30)
         if ok:
             logger.info("Cookie 登录验证成功")
         else:
-            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+            logger.error("Cookie 登录验证失败（页面已加载但未出现登录态），请检查 Cookie 是否包含 _t 且未过期")
+            self._page_diag(self.page, "cookie_login_fail")
+            self._dump_debug(self.page, "cookie_login_fail")
         return ok
 
     def login_by_password(self) -> bool:
@@ -311,12 +425,33 @@ class LinuxDoBrowser:
         try:
             if not self._goto_with_cf_retry(self.page, LOGIN_URL, wait_cf=60):
                 logger.error("Cloudflare 挑战持续未通过，账号密码登录终止")
+                self._page_diag(self.page, "pwd_cf_fail")
+                self._dump_debug(self.page, "pwd_cf_fail")
                 return False
+            self._page_diag(self.page, "login_page_loaded")
 
-            name_ele = self.page.ele("#login-account-name", timeout=15)
-            pwd_ele = self.page.ele("#login-account-password", timeout=10)
-            if not name_ele or not pwd_ele:
-                logger.error("未找到登录表单，可能被 Cloudflare 拦截或页面结构变化")
+            name_ele = pwd_ele = None
+            # /login 直接打开时 Discourse 会弹出登录 modal；若未弹出，尝试点头部登录按钮唤起
+            for attempt in range(2):
+                name_ele = self.page.ele("#login-account-name", timeout=15)
+                pwd_ele = self.page.ele("#login-account-password", timeout=5)
+                if name_ele and pwd_ele:
+                    break
+                logger.info("登录表单未出现，尝试点击头部登录按钮唤起...")
+                try:
+                    header_btn = self.page.ele(".login-button", timeout=5) or self.page.ele(
+                        "button.login-button", timeout=3
+                    )
+                    if header_btn:
+                        header_btn.click()
+                        time.sleep(3)
+                except Exception:
+                    pass
+
+            if not (name_ele and pwd_ele):
+                logger.error("未找到登录表单（页面非预期状态），已保存失败现场")
+                self._page_diag(self.page, "pwd_no_form")
+                self._dump_debug(self.page, "pwd_no_form")
                 return False
 
             name_ele.input(USERNAME)
@@ -327,11 +462,12 @@ class LinuxDoBrowser:
             login_btn = self.page.ele("#login-button", timeout=10)
             if not login_btn:
                 logger.error("未找到登录按钮")
+                self._dump_debug(self.page, "pwd_no_btn")
                 return False
             login_btn.click()
             logger.info("已提交登录表单，等待登录结果...")
 
-            if self._wait_login(35):
+            if self._wait_login(40):
                 logger.info("账号密码登录成功!")
                 return True
 
@@ -344,37 +480,51 @@ class LinuxDoBrowser:
             except Exception:
                 pass
             logger.error(f"账号密码登录失败 {('：' + err) if err else '(未出现登录态)'}")
+            self._page_diag(self.page, "pwd_login_fail")
+            self._dump_debug(self.page, "pwd_login_fail")
             return False
         except Exception as e:
             logger.error(f"浏览器登录异常: {e}")
             return False
 
     def login(self) -> bool:
-        """登录编排：Cookie 优先，失败回退账号密码"""
+        """
+        登录编排。
+        账号密码优先（Secrets 里永不过期，无需反复抓 Cookie）；
+        Cookie 作为没配账号密码时的可选路线（cf_clearance 绑 IP 且短命，
+        _t 之外的 Cookie 基本活不过一天，不适合长期自动化）。
+        """
         login_res = False
         login_method = "-"
 
-        if COOKIES:
-            if self.login_with_cookies(COOKIES):
-                login_res, login_method = True, "cookie"
-            else:
-                logger.warning("Cookie 登录失败，尝试账号密码登录...")
-                if self.login_by_password():
-                    login_res, login_method = True, "password"
-
-        if not login_res and not COOKIES:
+        if USERNAME and PASSWORD:
             if self.login_by_password():
                 login_res, login_method = True, "password"
+            elif COOKIES:
+                logger.warning("账号密码登录失败，回退尝试 Cookie 登录...")
+                if self.login_with_cookies(COOKIES):
+                    login_res, login_method = True, "cookie"
+        elif COOKIES:
+            if self.login_with_cookies(COOKIES):
+                login_res, login_method = True, "cookie"
 
         self.summary["login"] = login_res
         self.summary["login_method"] = login_method
 
         if login_res:
             try:
-                # 尝试从页面读取真实用户名
-                current = self.page.ele("@id=current-user", timeout=3)
-                if current:
-                    self.summary["username"] = current.attr("href").rstrip("/").split("/")[-1]
+                # 从 /session/current.json 读真实用户名（比解析 DOM 更可靠）
+                res = self.page.run_js(
+                    "var x=new XMLHttpRequest();"
+                    "x.open('GET','/session/current.json',false);"
+                    "try{x.send()}catch(e){return null}"
+                    "return x.status===200?x.responseText.substring(0,2000):null"
+                )
+                if res:
+                    data = json.loads(res)
+                    u = (data.get("current_user") or {}).get("username")
+                    if u:
+                        self.summary["username"] = u
             except Exception:
                 pass
             self._sync_session_cookies()
@@ -660,6 +810,8 @@ class LinuxDoBrowser:
             login_res = self.login()
             if not login_res:
                 logger.warning("登录验证失败，本次运行标记为失败")
+                self._page_diag(self.page, "run_login_fail")
+                self._dump_debug(self.page, "run_login_fail")
 
             if login_res and BROWSE_ENABLED:
                 try:

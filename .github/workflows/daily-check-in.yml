@@ -49,6 +49,15 @@ jobs:
         run: |
           python main.py
 
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Delete workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
