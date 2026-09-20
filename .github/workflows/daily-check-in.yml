@@ -10,16 +10,17 @@ on:
 jobs:
   run_script:
     runs-on: ubuntu-22.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: browser-actions/setup-chrome@v1
       - name: Check Chrome version
         run: chrome --version
-        
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9.19'
+          python-version: '3.11'
 
       - name: Install python dependencies
         run: |
@@ -32,6 +33,12 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
+          LINUXDO_COOKIES: ${{ secrets.LINUXDO_COOKIES }}
+          LINUXDO_CREDIT_COOKIES: ${{ secrets.LINUXDO_CREDIT_COOKIES }}
+          BROWSE_ENABLED: ${{ secrets.BROWSE_ENABLED }}
+          BROWSE_TOPIC_COUNT: ${{ secrets.BROWSE_TOPIC_COUNT }}
+          LIKE_ENABLED: ${{ secrets.LIKE_ENABLED }}
+          LDC_ENABLED: ${{ secrets.LDC_ENABLED }}
           GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
           GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
           SC3_PUSH_KEY: ${{ secrets.SC3_PUSH_KEY }}
@@ -39,8 +46,6 @@ jobs:
           WXPUSH_TOKEN: ${{ secrets.WXPUSH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          LINUXDO_COOKIES: ${{ secrets.LINUXDO_COOKIES }}
-          BROWSE_ENABLED: ${{ secrets.BROWSE_ENABLED }}
         run: |
           python main.py
 

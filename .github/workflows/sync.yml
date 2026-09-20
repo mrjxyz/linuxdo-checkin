@@ -2,9 +2,12 @@ name: Sync Upstream
 
 permissions: write-all              # grant write permission
 
-on: 
+on:
   schedule:
-    - cron: '0 0 * * *'             # scheduled for 00:00 every Monday
+    # 说明：本仓库已深度定制（新增 LDC 积分站查询、浏览器内登录等），
+    # 自动同步上游会产生冲突甚至覆盖定制内容，故关闭定时自动同步。
+    # 如需手动同步上游，请到 Actions 页面手动触发本工作流并自行解决冲突。
+    # - cron: '0 0 * * *'
   workflow_dispatch:                # trigger manually
 
 jobs:

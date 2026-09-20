@@ -1,12 +1,18 @@
 """
 cron: 0 */6 * * *
 new Env("Linux.Do 签到")
+
+LinuxDo 每日签到 + LDC 积分站余额查询
+- 论坛侧：登录 + 浏览主题帖（产生当日有效活跃，对应 LDC 每日登录奖励）
+- 积分站：credit.linux.do 拉取 LDC 余额 / 信任等级（接口经源码核实：
+  GET /api/v1/oauth/user-info，GET 请求无需 CSRF 头）
 """
 
 import os
 import random
 import time
 import functools
+from urllib.parse import urlparse
 from loguru import logger
 from DrissionPage import ChromiumOptions, Chromium
 from tabulate import tabulate
@@ -47,11 +53,26 @@ os.environ.pop("DYLD_LIBRARY_PATH", None)
 USERNAME = os.environ.get("LINUXDO_USERNAME")
 PASSWORD = os.environ.get("LINUXDO_PASSWORD")
 COOKIES = os.environ.get("LINUXDO_COOKIES", "").strip()  # 手动设置的 Cookie 字符串，优先使用
+CREDIT_COOKIES = os.environ.get("LINUXDO_CREDIT_COOKIES", "").strip()  # credit.linux.do Cookie，可选
 BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
     "false",
     "0",
     "off",
 ]
+# 点赞默认关闭：社区已取消点赞积分奖励，且脚本点赞有被判定为异常行为的风险
+LIKE_ENABLED = os.environ.get("LIKE_ENABLED", "false").strip().lower() in [
+    "true",
+    "1",
+    "on",
+]
+# LDC 积分站查询默认开启，失败不影响论坛签到结论
+LDC_ENABLED = os.environ.get("LDC_ENABLED", "true").strip().lower() not in [
+    "false",
+    "0",
+    "off",
+]
+BROWSE_TOPIC_COUNT = max(1, min(20, int(os.environ.get("BROWSE_TOPIC_COUNT", "10") or "10")))
+
 if not USERNAME:
     USERNAME = os.environ.get("USERNAME")
 if not PASSWORD:
@@ -61,6 +82,20 @@ HOME_URL = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
 SESSION_URL = "https://linux.do/session"
 CSRF_URL = "https://linux.do/session/csrf"
+CREDIT_HOME_URL = "https://credit.linux.do/home"
+CREDIT_USER_INFO_URL = "https://credit.linux.do/api/v1/oauth/user-info"
+CONNECT_URL = "https://connect.linux.do/"
+
+# Cloudflare 挑战页特征标题
+CF_TITLE_KEYWORDS = ("请稍候", "just a moment", "attention required")
+
+TRUST_LEVEL_NAMES = {
+    0: "新用户",
+    1: "基础用户",
+    2: "成员",
+    3: "活跃用户",
+    4: "领导者",
+}
 
 
 class LinuxDoBrowser:
@@ -81,9 +116,10 @@ class LinuxDoBrowser:
             .headless(True)
             .incognito(True)
             .set_argument("--no-sandbox")
+            .set_argument("--disable-dev-shm-usage")
         )
         co.set_user_agent(
-            f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+            f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         )
         self.browser = Chromium(co)
         self.page = self.browser.new_tab()
@@ -95,11 +131,23 @@ class LinuxDoBrowser:
                 "Accept-Language": "zh-CN,zh;q=0.9",
             }
         )
+        # 运行结果汇总
+        self.summary = {
+            "username": USERNAME or "-",
+            "login": False,
+            "login_method": "-",
+            "topics_visited": 0,
+            "likes": 0,
+            "ldc": {},
+            "connect_rows": [],
+        }
         # 初始化通知管理器
         self.notifier = NotificationManager()
 
+    # ---------------- 基础工具 ----------------
+
     @staticmethod
-    def parse_cookie_string(cookie_str: str) -> list[dict]:
+    def parse_cookie_string(cookie_str: str, domain: str = ".linux.do") -> list[dict]:
         """
         解析浏览器复制的 Cookie 字符串格式: "name1=value1; name2=value2"
         返回 DrissionPage 所需的 cookie 列表格式。
@@ -109,15 +157,120 @@ class LinuxDoBrowser:
             part = part.strip()
             if "=" in part:
                 name, _, value = part.partition("=")
+                name = name.strip()
+                value = value.strip()
+                if not name:
+                    continue
                 cookies.append(
                     {
-                        "name": name.strip(),
-                        "value": value.strip(),
-                        "domain": ".linux.do",
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
                         "path": "/",
                     }
                 )
         return cookies
+
+    @staticmethod
+    def _is_cf_challenge(page) -> bool:
+        """判断当前页面是否处于 Cloudflare 挑战页"""
+        try:
+            title = (page.title or "").strip().lower()
+        except Exception:
+            title = ""
+        if any(k in title for k in CF_TITLE_KEYWORDS):
+            return True
+        try:
+            html_head = (page.html or "")[:2000].lower()
+        except Exception:
+            html_head = ""
+        return ("cf-challenge" in html_head) or ("cdn-cgi/challenge-platform" in html_head)
+
+    def _wait_cf_clear(self, page, timeout: int = 45) -> bool:
+        """等待 Cloudflare 挑战结束"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._is_cf_challenge(page):
+                return True
+            time.sleep(2)
+        return not self._is_cf_challenge(page)
+
+    def _goto_with_cf_retry(self, page, url: str, attempts: int = 3, wait_cf: int = 45) -> bool:
+        """打开页面并等待 Cloudflare 放行；挑战是间歇性的，失败时重试可显著提高成功率"""
+        for i in range(attempts):
+            try:
+                page.get(url)
+            except Exception as e:
+                logger.warning(f"打开 {url} 异常: {e}")
+            if self._wait_cf_clear(page, wait_cf):
+                if i > 0:
+                    logger.info(f"第 {i + 1} 次尝试通过 Cloudflare")
+                return True
+            logger.warning(f"Cloudflare 挑战未通过 ({i + 1}/{attempts})，重试...")
+            time.sleep(random.uniform(3, 6))
+        return False
+
+    def _wait_login(self, timeout: int = 30) -> bool:
+        """
+        等待论坛登录态出现（严格判定）。
+        注意：不能用 "avatar" in html 这类宽松判断 —— Discourse 未登录页面的
+        HTML/JS 里也大量含 avatar 字符串，会误报登录成功。
+        #current-user 头像按钮仅在已登录时渲染。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self.page.ele("@id=current-user", timeout=2):
+                    return True
+            except Exception:
+                pass
+            time.sleep(2)
+        return False
+
+    def _sync_session_cookies(self, domain_filter: str = "linux.do") -> int:
+        """把浏览器当前页可见 Cookie 同步到 curl_cffi session（用于后续 API 请求）"""
+        count = 0
+        try:
+            for ck in self.page.cookies():
+                try:
+                    item = ck.as_dict() if hasattr(ck, "as_dict") else dict(ck)
+                except Exception:
+                    continue
+                dom = str(item.get("domain", ""))
+                name = item.get("name")
+                value = item.get("value")
+                if not name or value is None:
+                    continue
+                if domain_filter not in dom:
+                    continue
+                self.session.cookies.set(name, value, domain=dom.lstrip(".") or "linux.do")
+                count += 1
+        except Exception as e:
+            logger.warning(f"同步 Cookie 到 session 失败: {e}")
+        logger.info(f"已同步 {count} 个 Cookie 到 requests session")
+        return count
+
+    def _get_domain_cookies(self, domain_substr: str) -> dict:
+        """从浏览器读取指定域的 Cookie（需当前页在该域下）"""
+        result = {}
+        try:
+            for ck in self.page.cookies():
+                try:
+                    item = ck.as_dict() if hasattr(ck, "as_dict") else dict(ck)
+                except Exception:
+                    continue
+                dom = str(item.get("domain", ""))
+                name = item.get("name")
+                value = item.get("value")
+                if not name or value is None:
+                    continue
+                if domain_substr in dom:
+                    result[name] = value
+        except Exception as e:
+            logger.warning(f"读取 {domain_substr} Cookie 失败: {e}")
+        return result
+
+    # ---------------- 登录 ----------------
 
     def login_with_cookies(self, cookie_str: str) -> bool:
         """使用手动设置的 Cookie 直接登录，跳过账号密码流程"""
@@ -136,136 +289,125 @@ class LinuxDoBrowser:
         # 同步到 DrissionPage
         self.page.set.cookies(dp_cookies)
         logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-        time.sleep(5)
-
-        # 验证登录状态
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"Cookie 登录验证异常: {str(e)}")
-            return True
-        if not user_ele:
-            if "avatar" in self.page.html:
-                logger.info("Cookie 登录验证成功 (通过 avatar)")
-                return True
-            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+        if not self._goto_with_cf_retry(self.page, HOME_URL):
+            logger.error("Cloudflare 挑战持续未通过，Cookie 登录终止")
             return False
-        else:
+        time.sleep(3)
+
+        ok = self._wait_login(20)
+        if ok:
             logger.info("Cookie 登录验证成功")
-            return True
-
-    def login(self):
-        logger.info("开始账号密码登录")
-        # Step 1: Get CSRF Token
-        logger.info("获取 CSRF token...")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": LOGIN_URL,
-        }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="firefox135")
-        if resp_csrf.status_code != 200:
-            logger.error(f"获取 CSRF token 失败: {resp_csrf.status_code}")
-            return False        
-        csrf_data = resp_csrf.json()
-        csrf_token = csrf_data.get("csrf")
-        logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
-
-        # Step 2: Login
-        logger.info("正在登录...")
-        headers.update(
-            {
-                "X-CSRF-Token": csrf_token,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": "https://linux.do",
-            }
-        )
-
-        data = {
-            "login": USERNAME,
-            "password": PASSWORD,
-            "second_factor_method": "1",
-            "timezone": "Asia/Shanghai",
-        }
-
-        try:
-            resp_login = self.session.post(
-                SESSION_URL, data=data, impersonate="chrome136", headers=headers
-            )
-
-            if resp_login.status_code == 200:
-                response_json = resp_login.json()
-                if response_json.get("error"):
-                    logger.error(f"登录失败: {response_json.get('error')}")
-                    return False
-                logger.info("登录成功!")
-            else:
-                logger.error(f"登录失败，状态码: {resp_login.status_code}")
-                logger.error(resp_login.text)
-                return False
-        except Exception as e:
-            logger.error(f"登录请求异常: {e}")
-            return False
-
-        # Step 3: Pass cookies to DrissionPage
-        logger.info("同步 Cookie 到 DrissionPage...")
-
-        cookies_dict = self.session.cookies.get_dict()
-
-        dp_cookies = []
-        for name, value in cookies_dict.items():
-            dp_cookies.append(
-                {
-                    "name": name,
-                    "value": value,
-                    "domain": ".linux.do",
-                    "path": "/",
-                }
-            )
-
-        self.page.set.cookies(dp_cookies)
-
-        logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-
-        time.sleep(5)
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"登录验证失败: {str(e)}")
-            return True
-        if not user_ele:
-            # Fallback check for avatar
-            if "avatar" in self.page.html:
-                logger.info("登录验证成功 (通过 avatar)")
-                return True
-            logger.error("登录验证失败 (未找到 current-user)")
-            return False
         else:
-            logger.info("登录验证成功")
-            return True
+            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+        return ok
 
-    def click_topic(self):
+    def login_by_password(self) -> bool:
+        """在浏览器内完成账号密码登录（浏览器可承载 Cloudflare 挑战，比纯 HTTP 更稳）"""
+        if not USERNAME or not PASSWORD:
+            logger.warning("未提供账号密码，跳过浏览器登录")
+            return False
+
+        logger.info("开始账号密码登录（浏览器内）")
+        try:
+            if not self._goto_with_cf_retry(self.page, LOGIN_URL, wait_cf=60):
+                logger.error("Cloudflare 挑战持续未通过，账号密码登录终止")
+                return False
+
+            name_ele = self.page.ele("#login-account-name", timeout=15)
+            pwd_ele = self.page.ele("#login-account-password", timeout=10)
+            if not name_ele or not pwd_ele:
+                logger.error("未找到登录表单，可能被 Cloudflare 拦截或页面结构变化")
+                return False
+
+            name_ele.input(USERNAME)
+            time.sleep(random.uniform(0.5, 1.2))
+            pwd_ele.input(PASSWORD)
+            time.sleep(random.uniform(0.5, 1.2))
+
+            login_btn = self.page.ele("#login-button", timeout=10)
+            if not login_btn:
+                logger.error("未找到登录按钮")
+                return False
+            login_btn.click()
+            logger.info("已提交登录表单，等待登录结果...")
+
+            if self._wait_login(35):
+                logger.info("账号密码登录成功!")
+                return True
+
+            # 尝试读取错误提示
+            err = ""
+            try:
+                alert = self.page.ele("#modal-alert", timeout=3)
+                if alert:
+                    err = alert.text.strip()
+            except Exception:
+                pass
+            logger.error(f"账号密码登录失败 {('：' + err) if err else '(未出现登录态)'}")
+            return False
+        except Exception as e:
+            logger.error(f"浏览器登录异常: {e}")
+            return False
+
+    def login(self) -> bool:
+        """登录编排：Cookie 优先，失败回退账号密码"""
+        login_res = False
+        login_method = "-"
+
+        if COOKIES:
+            if self.login_with_cookies(COOKIES):
+                login_res, login_method = True, "cookie"
+            else:
+                logger.warning("Cookie 登录失败，尝试账号密码登录...")
+                if self.login_by_password():
+                    login_res, login_method = True, "password"
+
+        if not login_res and not COOKIES:
+            if self.login_by_password():
+                login_res, login_method = True, "password"
+
+        self.summary["login"] = login_res
+        self.summary["login_method"] = login_method
+
+        if login_res:
+            try:
+                # 尝试从页面读取真实用户名
+                current = self.page.ele("@id=current-user", timeout=3)
+                if current:
+                    self.summary["username"] = current.attr("href").rstrip("/").split("/")[-1]
+            except Exception:
+                pass
+            self._sync_session_cookies()
+
+        return login_res
+
+    # ---------------- 论坛活跃 ----------------
+
+    def click_topic(self) -> int:
+        """随机浏览主题帖，返回成功访问的数量"""
         topic_list = self.page.ele("@id=list-area").eles(".:title")
         if not topic_list:
             logger.error("未找到主题帖")
-            return False
-        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
-        for topic in random.sample(topic_list, 10):
-            self.click_one_topic(topic.attr("href"))
-        return True
+            return 0
+        sample_n = min(BROWSE_TOPIC_COUNT, len(topic_list))
+        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择 {sample_n} 个")
+        visited = 0
+        for topic in random.sample(topic_list, sample_n):
+            if self.click_one_topic(topic.attr("href")):
+                visited += 1
+        self.summary["topics_visited"] = visited
+        return visited
 
     @retry_decorator()
-    def click_one_topic(self, topic_url):
+    def click_one_topic(self, topic_url) -> bool:
         new_page = self.browser.new_tab()
         try:
             new_page.get(topic_url)
-            if random.random() < 0.3:  # 0.3 * 30 = 9
+            self._wait_cf_clear(new_page, 30)
+            if LIKE_ENABLED and random.random() < 0.3:
                 self.click_like(new_page)
             self.browse_post(new_page)
+            return True
         finally:
             try:
                 new_page.close()
@@ -282,7 +424,7 @@ class LinuxDoBrowser:
             page.run_js(f"window.scrollBy(0, {scroll_distance})")
             logger.info(f"已加载页面: {page.url}")
 
-            if random.random() < 0.03:  # 33 * 4 = 132
+            if random.random() < 0.03:  # 随机提前退出
                 logger.success("随机退出浏览")
                 break
 
@@ -302,26 +444,236 @@ class LinuxDoBrowser:
             logger.info(f"等待 {wait_time:.2f} 秒...")
             time.sleep(wait_time)
 
+    def click_like(self, page) -> bool:
+        try:
+            # 专门查找未点赞的按钮
+            like_button = page.ele(".discourse-reactions-reaction-button")
+            if like_button:
+                logger.info("找到未点赞的帖子，准备点赞")
+                like_button.click()
+                logger.info("点赞成功")
+                self.summary["likes"] += 1
+                time.sleep(random.uniform(1, 2))
+                return True
+            logger.info("帖子可能已经点过赞了")
+        except Exception as e:
+            logger.error(f"点赞失败: {str(e)}")
+        return False
+
+    # ---------------- LDC 积分站 ----------------
+
+    def _try_click_auth_entry(self, page) -> bool:
+        """在 credit 站登录页尝试点击登录/授权入口"""
+        keywords = ("登录", "Login", "Sign in", "授权", "Authorize", "Allow")
+        for kw in keywords:
+            try:
+                ele = page.ele(f"text:{kw}", timeout=1)
+                if ele:
+                    ele.click()
+                    logger.info(f"已点击入口: {kw}")
+                    time.sleep(3)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def fetch_ldc_info(self) -> dict:
+        """
+        拉取 credit.linux.do 的 LDC 余额信息。
+        优先：浏览器自动走 OAuth -> 提取 credit 会话 Cookie -> 调 API
+        兜底：使用 LINUXDO_CREDIT_COOKIES 手动提供的 Cookie
+        """
+        info = {"enabled": LDC_ENABLED, "ok": False, "available_balance": "-", "community_balance": "-", "pending_balance": "-", "trust_level": "-", "username": "-"}
+        if not LDC_ENABLED:
+            info["note"] = "LDC_ENABLED 未开启"
+            logger.info("LDC 查询未开启，跳过")
+            return info
+
+        credit_cookie_str = ""
+
+        # 路线 A：浏览器 OAuth 自动登录
+        try:
+            if not self._goto_with_cf_retry(self.page, CREDIT_HOME_URL, wait_cf=45):
+                logger.warning("credit.linux.do Cloudflare 挑战未通过，跳过浏览器自动登录")
+            else:
+                deadline = time.time() + 40
+                on_credit = False
+                while time.time() < deadline:
+                    host = urlparse(self.page.url).netloc
+                    if "credit.linux.do" in host:
+                        # 已回到 credit 站，再确认不是挑战页
+                        if not self._is_cf_challenge(self.page):
+                            on_credit = True
+                            break
+                    else:
+                        self._try_click_auth_entry(self.page)
+                    time.sleep(2)
+
+                if on_credit:
+                    cookies = self._get_domain_cookies("credit.linux.do")
+                    if cookies:
+                        credit_cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                        logger.info(f"已从浏览器获取 {len(cookies)} 个 credit.linux.do Cookie")
+                else:
+                    logger.warning("未能自动进入 credit.linux.do（OAuth 未完成）")
+        except Exception as e:
+            logger.warning(f"credit 站浏览器登录异常: {e}")
+
+        # 路线 B：手动 Cookie 兜底
+        if not credit_cookie_str and CREDIT_COOKIES:
+            credit_cookie_str = CREDIT_COOKIES
+            logger.info("使用手动提供的 LINUXDO_CREDIT_COOKIES")
+
+        if not credit_cookie_str:
+            info["note"] = "未获取到 credit.linux.do 会话"
+            logger.warning("未获取到 credit 站会话，跳过 LDC 查询")
+            return info
+
+        # 调用接口（GET，无需 CSRF 头，已核对 credit 源码 csrfMiddleware 仅校验写方法）
+        try:
+            credit_session = requests.Session()
+            credit_session.headers.update(
+                {
+                    "User-Agent": self.session.headers.get("User-Agent", "Mozilla/5.0"),
+                    "Accept": "application/json",
+                    "Referer": CREDIT_HOME_URL,
+                }
+            )
+            for part in credit_cookie_str.split(";"):
+                if "=" in part:
+                    n, _, v = part.partition("=")
+                    credit_session.cookies.set(n.strip(), v.strip(), domain="credit.linux.do")
+
+            resp = credit_session.get(CREDIT_USER_INFO_URL, impersonate="chrome136", timeout=20)
+            logger.info(f"credit user-info HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                payload = resp.json()
+                error_msg = payload.get("error_msg")
+                data = payload.get("data") or {}
+                if not error_msg and data:
+                    info.update(
+                        {
+                            "ok": True,
+                            "username": data.get("username", "-"),
+                            "available_balance": str(data.get("available_balance", "-")),
+                            "community_balance": str(data.get("community_balance", "-")),
+                            "pending_balance": str(data.get("pending_balance", "-")),
+                            "trust_level": TRUST_LEVEL_NAMES.get(
+                                data.get("trust_level"), str(data.get("trust_level", "-"))
+                            ),
+                        }
+                    )
+                    logger.success(
+                        f"LDC 查询成功: {info['username']} 可用 {info['available_balance']} / 社区 {info['community_balance']}"
+                    )
+                else:
+                    info["note"] = error_msg or "接口返回空数据"
+                    logger.warning(f"credit 接口返回异常: {error_msg}")
+            elif resp.status_code in (401, 403):
+                info["note"] = f"credit 会话无效 (HTTP {resp.status_code})"
+                logger.warning(info["note"])
+            else:
+                info["note"] = f"HTTP {resp.status_code}"
+                logger.warning(f"credit 接口异常: {resp.status_code}")
+        except Exception as e:
+            info["note"] = f"请求异常: {e}"
+            logger.error(f"LDC 查询异常: {e}")
+
+        self.summary["ldc"] = info
+        return info
+
+    # ---------------- Connect 信息 ----------------
+
+    def print_connect_info(self) -> list:
+        logger.info("获取连接信息")
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        }
+        rows = []
+        try:
+            resp = self.session.get(CONNECT_URL, headers=headers, impersonate="chrome136")
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for row in soup.select("table tr"):
+                cells = row.select("td")
+                if len(cells) >= 3:
+                    project = cells[0].text.strip()
+                    current = cells[1].text.strip() if cells[1].text.strip() else "0"
+                    requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
+                    rows.append([project, current, requirement])
+        except Exception as e:
+            logger.warning(f"Connect 信息获取失败: {e}")
+            return []
+
+        logger.info("--------------Connect Info-----------------")
+        logger.info("\n" + tabulate(rows, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+        self.summary["connect_rows"] = rows
+        return rows
+
+    # ---------------- 汇总与通知 ----------------
+
+    def build_report(self) -> str:
+        s = self.summary
+        lines = []
+        lines.append(f"👤 用户: {s.get('username') or '-'}")
+        lines.append(
+            f"🔑 登录: {'✅ 成功 (' + s.get('login_method', '-') + ')' if s.get('login') else '❌ 失败'}"
+        )
+        lines.append(f"📖 浏览主题: {s.get('topics_visited', 0)} 篇")
+        if LIKE_ENABLED:
+            lines.append(f"👍 点赞: {s.get('likes', 0)} 次")
+
+        ldc = s.get("ldc") or {}
+        if ldc.get("enabled"):
+            if ldc.get("ok"):
+                lines.append(
+                    f"💰 LDC: 可用 {ldc.get('available_balance')} | 社区 {ldc.get('community_balance')} | 待结算 {ldc.get('pending_balance')} | 信任等级 {ldc.get('trust_level')}"
+                )
+            else:
+                lines.append(f"💰 LDC: 查询失败 ({ldc.get('note', '未知原因')})")
+
+        connect_rows = s.get("connect_rows") or []
+        if connect_rows:
+            lines.append("🔗 Connect:")
+            for r in connect_rows[:8]:
+                lines.append(f"   · {r[0]}: {r[1]} / {r[2]}")
+
+        return "\n".join(lines)
+
+    def send_notifications(self, browse_enabled):
+        """发送签到通知"""
+        status_msg = f"✅每日登录成功: {self.summary.get('username')}"
+        if browse_enabled:
+            status_msg += f" + 浏览 {self.summary.get('topics_visited', 0)} 篇"
+        ldc = self.summary.get("ldc") or {}
+        if ldc.get("ok"):
+            status_msg += f" | LDC {ldc.get('available_balance')}"
+        elif ldc.get("enabled"):
+            status_msg += " | LDC 查询失败"
+
+        detail = self.build_report()
+        # 使用通知管理器发送所有通知
+        self.notifier.send_all("LINUX DO", f"{status_msg}\n\n{detail}")
+
     def run(self):
         try:
-            # 优先使用手动 Cookie 登录，没有再使用账号密码
-            if COOKIES:
-                login_res = self.login_with_cookies(COOKIES)
-                if not login_res:
-                    logger.warning("Cookie 登录失败，尝试账号密码登录...")
-                    login_res = self.login()
-            else:
-                login_res = self.login()
-            if not login_res:  # 登录
-                logger.warning("登录验证失败")
+            # 登录（Cookie 优先，账号密码兜底）
+            login_res = self.login()
+            if not login_res:
+                logger.warning("登录验证失败，本次运行标记为失败")
 
-            if BROWSE_ENABLED:
-                click_topic_res = self.click_topic()  # 点击主题
-                if not click_topic_res:
-                    logger.error("点击主题失败，程序终止")
-                    return
-                logger.info("完成浏览任务")
-            self.print_connect_info()  # 打印连接信息
+            if login_res and BROWSE_ENABLED:
+                try:
+                    visited = self.click_topic()  # 点击主题
+                    if visited:
+                        logger.info(f"完成浏览任务，共 {visited} 篇")
+                    else:
+                        logger.error("点击主题失败")
+                except Exception as e:
+                    logger.error(f"浏览任务异常: {e}")
+
+            if login_res:
+                self.fetch_ldc_info()  # LDC 积分站余额
+                self.print_connect_info()  # 打印连接信息
             self.send_notifications(BROWSE_ENABLED)  # 发送通知
         finally:
             try:
@@ -332,52 +684,6 @@ class LinuxDoBrowser:
                 self.browser.quit()
             except Exception:
                 pass
-
-    def click_like(self, page):
-        try:
-            # 专门查找未点赞的按钮
-            like_button = page.ele(".discourse-reactions-reaction-button")
-            if like_button:
-                logger.info("找到未点赞的帖子，准备点赞")
-                like_button.click()
-                logger.info("点赞成功")
-                time.sleep(random.uniform(1, 2))
-            else:
-                logger.info("帖子可能已经点过赞了")
-        except Exception as e:
-            logger.error(f"点赞失败: {str(e)}")
-
-    def print_connect_info(self):
-        logger.info("获取连接信息")
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        }
-        resp = self.session.get(
-            "https://connect.linux.do/", headers=headers, impersonate="chrome136"
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table tr")
-        info = []
-
-        for row in rows:
-            cells = row.select("td")
-            if len(cells) >= 3:
-                project = cells[0].text.strip()
-                current = cells[1].text.strip() if cells[1].text.strip() else "0"
-                requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
-                info.append([project, current, requirement])
-
-        logger.info("--------------Connect Info-----------------")
-        logger.info("\n" + tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
-
-    def send_notifications(self, browse_enabled):
-        """发送签到通知"""
-        status_msg = f"✅每日登录成功: {USERNAME}"
-        if browse_enabled:
-            status_msg += " + 浏览任务完成"
-        
-        # 使用通知管理器发送所有通知
-        self.notifier.send_all("LINUX DO", status_msg)
 
 
 if __name__ == "__main__":

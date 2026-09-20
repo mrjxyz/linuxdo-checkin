@@ -11,10 +11,27 @@
 
 有时会登录失败，重试一下就行了，嫌失败邮件通知烦的可以吧action的邮件通知关了
 
+## 本 Fork 的增强
+
+- **LDC 积分站查询**：签到后自动调用 `credit.linux.do` 的 `/api/v1/oauth/user-info` 接口，
+  上报「可用余额 / 社区余额 / 待结算余额 / 信任等级」。该接口已对照
+  [linux-do/credit](https://github.com/linux-do/credit) 源码核实（GET 请求无需 CSRF 头）。
+  会话获取优先走浏览器自动 OAuth（linux.do 已登录时通常自动完成），也可用
+  `LINUXDO_CREDIT_COOKIES` 手动提供 Cookie 兜底。
+- **浏览器内账号密码登录**：登录改为在 Chromium 内填表提交，可承载 Cloudflare 挑战，
+  比纯 HTTP POST 更稳；Cookie 登录失败时自动回退。
+- **登录判定修复**：原版在验证元素异常时会误报登录成功，现改为严格判定。
+- **修复主题数不足崩溃**：`random.sample` 在主题少于 10 篇时会抛异常，已改为按实际数量抽样。
+- **点赞默认关闭**：社区已取消点赞积分奖励，脚本点赞存在被判定异常行为的风险，
+  新增 `LIKE_ENABLED` 开关，默认 `false`。如需开启请自行承担风险。
+- **关闭上游自动同步**：因已深度定制，`sync.yml` 的定时同步已关闭（保留手动触发），
+  避免上游更新覆盖定制内容。
+
 ## 功能
 
 - 自动登录`LinuxDo`。
 - 自动浏览帖子。
+- 自动查询 `credit.linux.do` LDC 积分余额（可选）。
 - 每天在`GitHub Actions`中自动运行。
 - 支持`青龙面板` 和 `Github Actions` 自动运行。
 - (可选)`Telegram`通知功能，推送获取签到结果（目前只支持GitHub Actions方式）。
@@ -44,10 +61,23 @@
 
 ~~之前的USERNAME和PASSWORD环境变量仍然可用，但建议使用新的环境变量~~
 
+**LDC 积分站（可选）**
+
+| 环境变量名称                  | 描述                                          | 示例值                        |
+|-------------------------|---------------------------------------------|----------------------------|
+| `LINUXDO_CREDIT_COOKIES`| `credit.linux.do` 的 Cookie 字符串（兜底用，一般可省略） | `session=xxx`              |
+
+> 获取方式：浏览器登录 [credit.linux.do](https://credit.linux.do/home) → F12 → Application → Cookies → `https://credit.linux.do` → 复制为 `name=value; name2=value2` 格式。
+> 不配置时脚本会尝试用 linux.do 登录态自动完成 OAuth。
+
 ### 可选变量
 
 | 环境变量名称                | 描述                   | 示例值                                    |
 |----------------------|----------------------|----------------------------------------|
+| `BROWSE_ENABLED`     | 是否启用浏览帖子功能           | `true` 或 `false`，默认为 `true`           |
+| `BROWSE_TOPIC_COUNT` | 每次浏览的主题帖数量上限         | `1`-`20`，默认为 `10`                     |
+| `LIKE_ENABLED`       | 是否启用自动点赞（**默认关闭**，有风险） | `true` 或 `false`，默认为 `false`          |
+| `LDC_ENABLED`        | 是否查询 LDC 积分站余额       | `true` 或 `false`，默认为 `true`           |
 | `GOTIFY_URL`         | Gotify 服务器地址         | `https://your.gotify.server:8080`      |
 | `GOTIFY_TOKEN`       | Gotify 应用的 API Token | `your_application_token`               |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token   | `123456789:ABCdefghijklmnopqrstuvwxyz` |
@@ -55,7 +85,6 @@
 | `SC3_PUSH_KEY`       | Server酱³ SendKey     | `sctpxxxxt`                            |
 | `WXPUSH_URL`         | wxpush 服务器地址         | `https://your.wxpush.server`           |
 | `WXPUSH_TOKEN`       | wxpush 的 token       | `your_wxpush_token`                    |
-| `BROWSE_ENABLED`     | 是否启用浏览帖子功能           | `true` 或 `false`，默认为 `true`           |
 
 ---
 
