@@ -54,6 +54,7 @@ os.environ.pop("DYLD_LIBRARY_PATH", None)
 USERNAME = os.environ.get("LINUXDO_USERNAME")
 PASSWORD = os.environ.get("LINUXDO_PASSWORD")
 COOKIES = os.environ.get("LINUXDO_COOKIES", "").strip()  # 手动设置的 Cookie 字符串，优先使用
+API_KEY = os.environ.get("LINUXDO_API_KEY", "").strip()  # Discourse 用户 API Key（推荐，长效免维护）
 CREDIT_COOKIES = os.environ.get("LINUXDO_CREDIT_COOKIES", "").strip()  # credit.linux.do Cookie，可选
 BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
     "false",
@@ -105,29 +106,27 @@ TRUST_LEVEL_NAMES = {
 
 class LinuxDoBrowser:
     def __init__(self) -> None:
-        from sys import platform
-
-        if platform == "linux" or platform == "linux2":
-            platformIdentifier = "X11; Linux x86_64"
-        elif platform == "darwin":
-            platformIdentifier = "Macintosh; Intel Mac OS X 10_15_7"
-        elif platform == "win32":
-            platformIdentifier = "Windows NT 10.0; Win64; x64"
-        else:
-            platformIdentifier = "X11; Linux x86_64"
-
         co = (
             ChromiumOptions()
             .headless(True)
             .incognito(True)
             .set_argument("--no-sandbox")
             .set_argument("--disable-dev-shm-usage")
-        )
-        co.set_user_agent(
-            f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            .set_argument("--disable-blink-features=AutomationControlled")
+            .set_argument("--lang=zh-CN")
         )
         self.browser = Chromium(co)
         self.page = self.browser.new_tab()
+        # UA 必须与真实引擎一致：硬编码版本号会与 Sec-CH-UA / JS 特征矛盾，
+        # 是 Cloudflare 判定机器人的强信号。取浏览器原生 UA 并抹掉 Headless 标记。
+        try:
+            native_ua = self.browser.user_agent or self.page.user_agent or ""
+            if native_ua:
+                fixed_ua = native_ua.replace("HeadlessChrome", "Chrome")
+                self.page.set.user_agent(fixed_ua)
+                logger.info(f"使用与引擎匹配的 UA: {fixed_ua[:80]}...")
+        except Exception as e:
+            logger.warning(f"UA 设置失败（使用浏览器默认）: {e}")
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -137,6 +136,7 @@ class LinuxDoBrowser:
             }
         )
         # 运行结果汇总
+        self.api_session = None  # API Key 登录成功后创建
         self.summary = {
             "username": USERNAME or "-",
             "login": False,
@@ -216,7 +216,14 @@ class LinuxDoBrowser:
         except Exception:
             html_len = -1
         cf = "yes" if cls._is_cf_challenge(page) else "no"
-        logger.info(f"[诊断:{tag}] title={title!r} url={url} html_len={html_len} cf_challenge={cf}")
+        try:
+            raw = page.html or ""
+            head = raw[:200].replace("\n", " ").replace("\r", "")
+        except Exception:
+            head = "<err>"
+        logger.info(
+            f"[诊断:{tag}] title={title!r} url={url} html_len={html_len} cf_challenge={cf} html_head={head!r}"
+        )
 
     def _dump_debug(self, page, tag: str) -> None:
         """失败现场留证：截图 + HTML，供 GitHub Actions artifact 下载排查"""
@@ -284,18 +291,38 @@ return [r.x, r.y, r.width, r.height];
             time.sleep(3)
         return not self._is_cf_challenge(page)
 
-    def _goto_with_cf_retry(self, page, url: str, attempts: int = 3, wait_cf: int = 45) -> bool:
-        """打开页面并等待 Cloudflare 放行；挑战是间歇性的，失败时重试可显著提高成功率"""
+    def _goto_with_cf_retry(self, page, url: str, attempts: int = 4, wait_cf: int = 45) -> bool:
+        """
+        打开页面并等待 Cloudflare 放行。
+        两类失败都会重试：
+        1. CF 挑战页（间歇性，等即可）
+        2. 导航层失败（Chrome 错误页：标题=URL、HTML 只剩百来字节空壳，
+           表现为连接被重置/空响应；若不检测会被误认为正常页面）
+        """
         for i in range(attempts):
+            loaded = False
             try:
-                page.get(url)
+                loaded = bool(page.get(url))
             except Exception as e:
                 logger.warning(f"打开 {url} 异常: {e}")
+            if not loaded:
+                logger.warning(f"页面加载失败 ({i + 1}/{attempts})，重试...")
+                time.sleep(random.uniform(3, 6))
+                continue
             if self._wait_cf_clear(page, wait_cf):
-                if i > 0:
-                    logger.info(f"第 {i + 1} 次尝试通过 Cloudflare")
-                return True
-            logger.warning(f"Cloudflare 挑战未通过 ({i + 1}/{attempts})，重试...")
+                try:
+                    html_len = len(page.html or "")
+                except Exception:
+                    html_len = 0
+                if html_len >= 1000:
+                    if i > 0:
+                        logger.info(f"第 {i + 1} 次尝试成功")
+                    return True
+                # 小页面且非挑战页 => 多半是 Chrome 错误页
+                self._page_diag(page, f"goto_suspicious_html_{i + 1}")
+                logger.warning(f"页面 HTML 异常过小 (html_len={html_len})，疑似加载失败 ({i + 1}/{attempts})，重试...")
+            else:
+                logger.warning(f"Cloudflare 挑战未通过 ({i + 1}/{attempts})，重试...")
             time.sleep(random.uniform(3, 6))
         return False
 
@@ -487,24 +514,121 @@ return [r.x, r.y, r.width, r.height];
             logger.error(f"浏览器登录异常: {e}")
             return False
 
+    # ---------------- User API Key 路线（推荐） ----------------
+
+    def _api_request(self, method: str, path: str, **kwargs):
+        """带 User-Api-Key 头的 HTTP 请求（curl_cffi 模拟 Chrome TLS 指纹过 CF）"""
+        return self.api_session.request(
+            method,
+            f"https://linux.do{path}",
+            headers={"User-Api-Key": API_KEY, "Accept": "application/json", **kwargs.pop("headers", {})},
+            timeout=30,
+            **kwargs,
+        )
+
+    def login_with_api_key(self) -> bool:
+        """
+        使用 Discourse 用户 API Key 登录（纯 HTTP，无需浏览器过盾）。
+        Key 通过 tools/generate_api_key.py 一次性授权获得，
+        只要不长期闲置就不会过期（Discourse 规则：180 天未使用才失效）。
+        """
+        if not API_KEY:
+            return False
+        logger.info("检测到 LINUXDO_API_KEY，尝试 API Key 登录（纯 HTTP）...")
+        from curl_cffi import requests as cureq
+
+        self.api_session = cureq.Session(impersonate="chrome")
+        try:
+            r = self._api_request("GET", "/session/current.json")
+        except Exception as e:
+            logger.error(f"API Key 请求异常: {e}")
+            return False
+        if r.status_code == 403:
+            logger.error("API Key 登录被拒 (HTTP 403)：Key 无效/已撤销，或请求被 Cloudflare 拦截")
+            return False
+        if r.status_code != 200:
+            logger.error(f"API Key 登录失败: HTTP {r.status_code}")
+            return False
+        try:
+            data = r.json().get("current_user") or {}
+        except Exception:
+            logger.error("API 响应不是合法 JSON（可能被 Cloudflare 拦截）")
+            return False
+        username = data.get("username")
+        if not username:
+            logger.error("API 响应中无用户信息，Key 可能已失效")
+            return False
+        self.summary["username"] = username
+        self.summary["login_method"] = "api_key"
+        logger.success(f"API Key 登录成功，用户: {username} (信任等级 {data.get('trust_level', '?')})")
+        return True
+
+    def browse_via_api(self) -> int:
+        """
+        纯 API 方式产生论坛活跃：拉最新主题 -> 逐个读取 -> 上报阅读计时。
+        等价于浏览器读帖（Discourse 客户端本身就是这么上报阅读时长的）。
+        """
+        visited = 0
+        try:
+            r = self._api_request("GET", "/latest.json")
+            if r.status_code != 200:
+                logger.error(f"拉取主题列表失败: HTTP {r.status_code}")
+                return 0
+            topics = (r.json().get("topic_list") or {}).get("topics") or []
+            candidates = [t for t in topics if not t.get("pinned")] or topics
+            picked = random.sample(candidates, min(BROWSE_TOPIC_COUNT, len(candidates)))
+            for t in picked:
+                tid, slug = t.get("id"), t.get("slug") or "topic"
+                try:
+                    tr = self._api_request("GET", f"/t/{tid}.json")
+                    if tr.status_code != 200:
+                        logger.warning(f"读取主题 {tid} 失败: HTTP {tr.status_code}")
+                        continue
+                    posts = (tr.json().get("post_stream") or {}).get("posts") or []
+                    # 按楼层逐个上报阅读时长（与网页端行为一致）
+                    for p in posts[:8]:
+                        pn = p.get("post_number")
+                        if pn:
+                            time.sleep(random.uniform(1.0, 2.5))
+                            self._api_request(
+                                "POST",
+                                "/topics/timings",
+                                data={
+                                    "topic_id": tid,
+                                    "topic_time": int(random.uniform(4000, 12000)),
+                                    f"timings[{pn}]": int(random.uniform(3000, 9000)),
+                                },
+                                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            )
+                    visited += 1
+                    logger.info(f"已阅读主题 {tid} ({t.get('title', '')[:30]}...)")
+                    time.sleep(random.uniform(2.0, 4.0))
+                except Exception as e:
+                    logger.warning(f"处理主题 {tid} 异常: {e}")
+        except Exception as e:
+            logger.error(f"API 浏览异常: {e}")
+        return visited
+
     def login(self) -> bool:
         """
-        登录编排。
-        账号密码优先（Secrets 里永不过期，无需反复抓 Cookie）；
-        Cookie 作为没配账号密码时的可选路线（cf_clearance 绑 IP 且短命，
-        _t 之外的 Cookie 基本活不过一天，不适合长期自动化）。
+        登录编排（按稳定性排序）：
+        1. User API Key（纯 HTTP、长效、无浏览器指纹问题）—— 配了就优先用
+        2. 账号密码（Secrets 永不过期，但需浏览器承载 CF 挑战）
+        3. Cookie（cf_clearance 绑 IP 且短命，仅作最后兜底）
         """
         login_res = False
         login_method = "-"
 
-        if USERNAME and PASSWORD:
+        if API_KEY and self.login_with_api_key():
+            login_res, login_method = True, "api_key"
+        if not login_res and USERNAME and PASSWORD:
             if self.login_by_password():
                 login_res, login_method = True, "password"
             elif COOKIES:
                 logger.warning("账号密码登录失败，回退尝试 Cookie 登录...")
                 if self.login_with_cookies(COOKIES):
                     login_res, login_method = True, "cookie"
-        elif COOKIES:
+        elif not login_res and COOKIES:
             if self.login_with_cookies(COOKIES):
                 login_res, login_method = True, "cookie"
 
@@ -815,11 +939,14 @@ return [r.x, r.y, r.width, r.height];
 
             if login_res and BROWSE_ENABLED:
                 try:
-                    visited = self.click_topic()  # 点击主题
+                    if self.summary.get("login_method") == "api_key":
+                        visited = self.browse_via_api()  # 纯 API 活跃（推荐路线）
+                    else:
+                        visited = self.click_topic()  # 浏览器活跃（回退路线）
                     if visited:
                         logger.info(f"完成浏览任务，共 {visited} 篇")
                     else:
-                        logger.error("点击主题失败")
+                        logger.error("浏览任务未产生任何有效活跃")
                 except Exception as e:
                     logger.error(f"浏览任务异常: {e}")
 
@@ -839,8 +966,13 @@ return [r.x, r.y, r.width, r.height];
 
 
 if __name__ == "__main__":
-    if not COOKIES and (not USERNAME or not PASSWORD):
-        print("请设置 LINUXDO_COOKIES（Cookie 登录），或同时设置 USERNAME 和 PASSWORD（账号密码登录）")
+    if not API_KEY and not COOKIES and (not USERNAME or not PASSWORD):
+        print(
+            "请配置登录方式（推荐顺序）：\n"
+            "1. LINUXDO_API_KEY —— 用 tools/generate_api_key.py 一次性授权生成（推荐）\n"
+            "2. LINUXDO_USERNAME + LINUXDO_PASSWORD —— 账号密码登录\n"
+            "3. LINUXDO_COOKIES —— Cookie 登录（不推荐，易失效）"
+        )
         exit(1)
     browser = LinuxDoBrowser()
     browser.run()

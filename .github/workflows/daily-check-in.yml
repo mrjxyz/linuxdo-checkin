@@ -14,6 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
       - name: Check Chrome version
         run: chrome --version
 
@@ -34,6 +36,7 @@ jobs:
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           LINUXDO_COOKIES: ${{ secrets.LINUXDO_COOKIES }}
+          LINUXDO_API_KEY: ${{ secrets.LINUXDO_API_KEY }}
           LINUXDO_CREDIT_COOKIES: ${{ secrets.LINUXDO_CREDIT_COOKIES }}
           BROWSE_ENABLED: ${{ secrets.BROWSE_ENABLED }}
           BROWSE_TOPIC_COUNT: ${{ secrets.BROWSE_TOPIC_COUNT }}
